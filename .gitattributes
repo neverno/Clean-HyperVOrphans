@@ -1,0 +1,13 @@
+# 默认按文本处理，检出时统一 CRLF（脚本与 bat 类文件在 Windows 上更稳）
+* text=auto eol=crlf
+
+# 二进制资源必须明确排除，否则会被换行转换破坏
+*.ico binary
+*.png binary
+*.exe binary
+
+# 文档用 LF，跨平台阅读正常
+*.md text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

@@ -1,0 +1,9 @@
+# 编译产物
+*.exe
+*.win32manifest
+_build*
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store
