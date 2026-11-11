@@ -1,5 +1,7 @@
 # Clean-HyperVOrphans
 
+**简体中文** | [English](README.en.md)
+
 清理 Hyper-V 管理器删除虚拟机后**残留在磁盘上的 VHDX / AVHDX 文件**。
 
 > **「孤儿」是什么意思**
