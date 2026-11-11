@@ -1,5 +1,6 @@
 # 编译产物
 *.exe
+*.exe.bak
 *.win32manifest
 _build*
 

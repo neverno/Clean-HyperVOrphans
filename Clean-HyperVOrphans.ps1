@@ -1,5 +1,8 @@
 ﻿<#
-.SYNOPSIS  盘点 Hyper-V 已删虚拟机残留的 VHDX/AVHDX，确认后移入回收站（带回收站配额预检）
+.SYNOPSIS
+    盘点 Hyper-V 已删虚拟机残留的 VHDX/AVHDX，确认后移入回收站（带回收站配额预检）
+    Inventory VHDX/AVHDX left behind by deleted Hyper-V VMs, then move them to the
+    Recycle Bin after confirmation (with a recycle-bin quota pre-check).
 .DESCRIPTION
     可直接拷贝到其他 Windows 电脑运行，无需修改。每次运行都会重新读取当前机器的
     回收站配置，按实际配额判断哪些文件能真正进入回收站、哪些会被 Windows 永久删除。
@@ -13,16 +16,52 @@
       [直接回收] 回收站剩余空间够，不挤占任何旧文件
       [挤占回收] 单个文件不超上限，但空间不够，会挤掉回收站里最旧的条目
       [永久删除] 单个文件超过该盘回收站上限，Windows 必然永久删除，需输入 NUKE 二次确认
-.PARAMETER None
+
+    Portable: copy it to any Windows machine and run it as is. The recycle-bin
+    configuration is re-read on every run, so files are always classified by the
+    actual quota of the machine the tool is running on.
+
+    Quota is read in this order:
+      1. HKCU\...\Explorer\BitBucket\Volume\{volume GUID}\MaxCapacity (custom value)
+      2. Otherwise derived from the Windows default rule:
+         min(capacity,40GB)*10% + portion above 40GB*5%
+
+    Files fall into three tiers: straight to the Recycle Bin / displaces older
+    Recycle Bin entries / permanently deleted (the last one needs NUKE).
+.PARAMETER Lang
+    界面语言：auto（默认，按系统语言自动选择）/ zh（中文）/ en（English）
+    UI language: auto (default, follows the system locale) / zh / en
 .NOTES
     需要管理员权限（读取回收站占用、调用 Hyper-V 相关 cmdlet）。
     编码为 UTF-8 with BOM，可在任意语言版本的 Windows 上正常显示中文。
+    Requires administrator rights; the source file must stay UTF-8 with BOM.
 #>
 
-param()
+param(
+    [ValidateSet('auto', 'zh', 'en')]
+    [string]$Lang = 'auto'
+)
+
+# ---------- 语言：auto 时系统界面是中文就用中文，其余一律英文 ----------
+if ($Lang -eq 'auto') {
+    $uiName = ''
+    try { $uiName = [System.Globalization.CultureInfo]::CurrentUICulture.Name } catch { }
+    if (-not $uiName) { try { $uiName = $PSUICulture } catch { } }
+    if ($uiName -match '^zh') { $Lang = 'zh' } else { $Lang = 'en' }
+}
+
+# T '中文' 'English'：按当前语言取值，所有对外文案都经它一层
+function T {
+    param([string]$Zh, [string]$En)
+    if ($script:Lang -eq 'en') { return $En }
+    return $Zh
+}
 
 # 窗口标题：双击 exe 运行时覆盖掉那一长串路径；ISE 等宿主不支持 RawUI 时忽略
-try { $Host.UI.RawUI.WindowTitle = '清理 Hyper-V 残留磁盘  v1.0' } catch { }
+try {
+    $title = T '清理 Hyper-V 残留磁盘  v1.1' 'Hyper-V Orphan Disk Cleanup  v1.1'
+    $Host.UI.RawUI.WindowTitle = $title
+} catch { }
 
 # ---------- 窗口布局：尺寸 120x40 / 缓冲 3000 行 / 屏幕居中 ----------
 # 四条限制，顺序弄反就白设：
@@ -108,7 +147,8 @@ Set-ConsoleLayout -Width 120 -Height 40 -BufferHeight 3000 -Center
 
 # ---------- 0. 基础函数 ----------
 function Wait-Exit {
-    param([string]$Message = "按任意键退出...")
+    param([string]$Message = '')
+    if (-not $Message) { $Message = T '按任意键退出...' 'Press any key to exit...' }
     Write-Host "`n$Message" -ForegroundColor Yellow
     try {
         $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
@@ -118,7 +158,8 @@ function Wait-Exit {
 }
 
 trap {
-    Write-Host "`n脚本出错: $_" -ForegroundColor Red
+    $m = T "`n脚本出错: $_" "`nScript error: $_"
+    Write-Host $m -ForegroundColor Red
     Wait-Exit
     break
 }
@@ -138,10 +179,12 @@ function Test-IsAdmin {
 function Get-RecyclePolicy {
     param([string]$DriveLetter)   # 形如 "D:"
 
+    $srcUnknown = T '未知' 'unknown'
+
     $result = [PSCustomObject]@{
         Drive        = $DriveLetter
         MaxBytes     = [int64]0
-        MaxSource    = '未知'
+        MaxSource    = $srcUnknown
         NukeOnDelete = 0
         HasFolder    = $false
         FixedDisk    = $false
@@ -164,7 +207,7 @@ function Get-RecyclePolicy {
             $pp = Get-ItemProperty $key -ErrorAction SilentlyContinue
             if ($pp.MaxCapacity) {
                 $result.MaxBytes  = [int64]$pp.MaxCapacity * 1MB
-                $result.MaxSource = '自定义'
+                $result.MaxSource = T '自定义' 'custom'
             }
             if ($null -ne $pp.NukeOnDelete) { $result.NukeOnDelete = [int]$pp.NukeOnDelete }
         }
@@ -176,7 +219,7 @@ function Get-RecyclePolicy {
         $first   = [math]::Min($capMB, 40960) * 0.10
         $rest    = [math]::Max(0, $capMB - 40960) * 0.05
         $result.MaxBytes  = [int64](($first + $rest) * 1MB)
-        $result.MaxSource = '默认推算'
+        $result.MaxSource = T '默认推算' 'derived'
     }
 
     return $result
@@ -208,33 +251,63 @@ function Format-Size {
     return ("{0:N0} KB" -f ($Bytes / 1KB))
 }
 
+# 表头随语言切换：内部属性名保持中文，展示时用 Name/Expression 重命名列
+function Show-OrphanTable {
+    param(
+        [object[]]$Items,
+        [string[]]$Columns
+    )
+    $props = @()
+    foreach ($col in $Columns) {
+        switch ($col) {
+            'No'        { $props += @{ Name = (T '序号' '#');         Expression = { $_.序号 } } }
+            'Risk'      { $props += @{ Name = (T '风险' 'Risk');      Expression = { $_.风险 } } }
+            'Type'      { $props += @{ Name = (T '类型' 'Type');      Expression = { $_.类型 } } }
+            'SizeGB'    { $props += @{ Name = (T '大小GB' 'Size GB'); Expression = { $_.大小GB } } }
+            'Drive'     { $props += @{ Name = (T '盘符' 'Drive');     Expression = { $_.盘符 } } }
+            'LastWrite' { $props += @{ Name = (T '最后写入' 'Last write'); Expression = { $_.最后写入 } } }
+            'Path'      { $props += @{ Name = (T '路径' 'Path');      Expression = { $_.路径 } } }
+        }
+    }
+    $Items | Select-Object -Property $props | Format-Table -AutoSize -Wrap
+}
+
 # ---------- 0.5 运行环境自检 ----------
-Write-Host "`n[0/5] 运行环境自检..." -ForegroundColor Cyan
+Write-Host (T "`n[0/5] 运行环境自检..." "`n[0/5] Environment self-check...") -ForegroundColor Cyan
+
+if ($Lang -eq 'en') {
+    Write-Host '  UI language: English (auto-detected; use -Lang zh to switch)' -ForegroundColor Gray
+} else {
+    Write-Host '  界面语言: 中文（自动检测；可用 -Lang en 切换）' -ForegroundColor Gray
+}
 
 $IsAdmin = Test-IsAdmin
 if ($IsAdmin) {
-    Write-Host "  权限: 管理员（可读取回收站占用）" -ForegroundColor Gray
+    Write-Host (T '  权限: 管理员（可读取回收站占用）' '  Rights: administrator (recycle-bin usage readable)') -ForegroundColor Gray
 } else {
-    Write-Host "  权限: 非管理员 —— 读不到回收站已占用量，只能按文件大小判断，建议右键以管理员身份运行" -ForegroundColor Yellow
+    $m = T '  权限: 非管理员 —— 读不到回收站已占用量，只能按文件大小判断，建议右键以管理员身份运行' '  Rights: not administrator - recycle-bin usage is unreadable, decisions fall back to file size. Run elevated instead.'
+    Write-Host $m -ForegroundColor Yellow
 }
 
 $hasHyperV = $false
 try { $null = Get-Command Get-VM -ErrorAction Stop; $hasHyperV = $true } catch { }
 
 if ($hasHyperV) {
-    Write-Host "  Hyper-V 模块: 已安装" -ForegroundColor Gray
+    Write-Host (T '  Hyper-V 模块: 已安装' '  Hyper-V module: installed') -ForegroundColor Gray
 } else {
-    Write-Host "  Hyper-V 模块: 未安装 —— 无法识别正在被虚拟机使用的磁盘" -ForegroundColor Yellow
-    $goOn = Read-Host "  继续扫描可能误删使用中的磁盘，风险很高。仍要继续请输入 CONTINUE"
+    $m = T '  Hyper-V 模块: 未安装 —— 无法识别正在被虚拟机使用的磁盘' '  Hyper-V module: not installed - disks in use by virtual machines cannot be identified'
+    Write-Host $m -ForegroundColor Yellow
+    $m = T '  继续扫描可能误删使用中的磁盘，风险很高。仍要继续请输入 CONTINUE' '  Continuing may delete a disk that is in use. Type CONTINUE to proceed anyway'
+    $goOn = Read-Host $m
     if ($goOn -ne 'CONTINUE') {
-        Write-Host "已退出。" -ForegroundColor Gray
+        Write-Host (T '已退出。' 'Aborted.') -ForegroundColor Gray
         Wait-Exit
         return
     }
 }
 
 # ---------- 1. 收集当前已占用的磁盘路径 ----------
-Write-Host "`n[1/5] 正在收集当前 Hyper-V 正在使用的磁盘..." -ForegroundColor Cyan
+Write-Host (T "`n[1/5] 正在收集当前 Hyper-V 正在使用的磁盘..." "`n[1/5] Collecting disks currently in use by Hyper-V...") -ForegroundColor Cyan
 
 $inUsePaths = @{}
 
@@ -261,10 +334,11 @@ if ($hasHyperV) {
     }
 }
 
-Write-Host "  当前占用的磁盘: $($inUsePaths.Keys.Count) 条" -ForegroundColor Gray
+$m = T "  当前占用的磁盘: $($inUsePaths.Keys.Count) 条" "  Disks in use: $($inUsePaths.Keys.Count)"
+Write-Host $m -ForegroundColor Gray
 
 # ---------- 2. 确定扫描路径 ----------
-Write-Host "`n[2/5] 确定扫描目录..." -ForegroundColor Cyan
+Write-Host (T "`n[2/5] 确定扫描目录..." "`n[2/5] Determining scan paths...") -ForegroundColor Cyan
 
 $scanPaths = @()
 if ($hasHyperV) {
@@ -276,26 +350,30 @@ $scanPaths += "$env:PUBLIC\Documents\Hyper-V\Virtual Hard Disks"
 
 $scanPaths = $scanPaths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
 
-$extra = Read-Host "`n如需额外扫描其他盘符/路径（如 D:\VMs），多个路径用逗号分隔，回车跳过"
+$m = T "`n如需额外扫描其他盘符/路径（如 D:\VMs），多个路径用逗号分隔，回车跳过" "`nExtra paths to scan (e.g. D:\VMs), comma-separated, Enter to skip"
+$extra = Read-Host $m
 if ($extra.Trim()) {
     $extra -split ',' | ForEach-Object {
         $p = $_.Trim()
         if (Test-Path $p) { $scanPaths += $p }
-        else { Write-Host "  跳过不存在的路径: $p" -ForegroundColor Yellow }
+        else {
+            $m2 = T "  跳过不存在的路径: $p" "  Skipped, path does not exist: $p"
+            Write-Host $m2 -ForegroundColor Yellow
+        }
     }
 }
 
 if ($scanPaths.Count -eq 0) {
-    Write-Host "  没有任何可扫描目录，退出。" -ForegroundColor Yellow
+    Write-Host (T '  没有任何可扫描目录，退出。' '  No scannable directory, aborting.') -ForegroundColor Yellow
     Wait-Exit
     return
 }
 
-Write-Host "  扫描目录:" -ForegroundColor Gray
+Write-Host (T '  扫描目录:' '  Scan paths:') -ForegroundColor Gray
 $scanPaths | ForEach-Object { Write-Host "   - $_" -ForegroundColor Gray }
 
 # ---------- 3. 扫描并比对孤儿文件 ----------
-Write-Host "`n[3/5] 扫描 VHDX/AVHDX 文件..." -ForegroundColor Cyan
+Write-Host (T "`n[3/5] 扫描 VHDX/AVHDX 文件..." "`n[3/5] Scanning VHDX/AVHDX files...") -ForegroundColor Cyan
 
 $candidates = @()
 $idx = 0
@@ -311,22 +389,20 @@ foreach ($base in $scanPaths) {
         if ($isInUse) { return }
 
         $idx++
-        $risk = '[安全]'
-        $reason = '无 VM 关联'
+        $risk = T '[安全]' '[Safe]'
+        $reason = T '无 VM 关联' 'no VM reference'
 
         if ($_.Extension -eq '.avhdx') {
+            $risk = T '[谨慎]' '[Caution]'
             try {
                 $vhd = Get-VHD $full -ErrorAction Stop
                 if ($vhd.ParentPath) {
-                    $risk = '[谨慎]'
-                    $reason = "存在父盘，请核对: $($vhd.ParentPath)"
+                    $reason = T "存在父盘，请核对: $($vhd.ParentPath)" "has a parent disk, verify: $($vhd.ParentPath)"
                 } else {
-                    $risk = '[谨慎]'
-                    $reason = '孤立差分盘，可能残留差异数据'
+                    $reason = T '孤立差分盘，可能残留差异数据' 'isolated differencing disk, may still hold unmerged data'
                 }
             } catch {
-                $risk = '[谨慎]'
-                $reason = '无法读取 VHD 信息，建议再次核对'
+                $reason = T '无法读取 VHD 信息，建议再次核对' 'cannot read VHD info, verify manually'
             }
         }
 
@@ -345,27 +421,30 @@ foreach ($base in $scanPaths) {
 }
 
 # ---------- 4. 展示清单 ----------
-Write-Host "`n[4/5] 清单如下" -ForegroundColor Cyan
+Write-Host (T "`n[4/5] 清单如下" "`n[4/5] Orphan list") -ForegroundColor Cyan
 if ($candidates.Count -eq 0) {
-    Write-Host "  未发现孤儿 VHDX/AVHDX 文件，空间可能被其他对象占用。" -ForegroundColor Green
+    $m = T '  未发现孤儿 VHDX/AVHDX 文件，空间可能被其他对象占用。' '  No orphan VHDX/AVHDX found; the space may be held by something else.'
+    Write-Host $m -ForegroundColor Green
     Wait-Exit
     return
 }
 
-$candidates | Format-Table 序号, 风险, 类型, 大小GB, 盘符, 最后写入, 路径 -AutoSize -Wrap
+Show-OrphanTable -Items $candidates -Columns 'No', 'Risk', 'Type', 'SizeGB', 'Drive', 'LastWrite', 'Path'
 
-Write-Host "`n请输入要清理的文件序号（支持 1,3,5 或 1-4；输入 ALL 全选；输入 N 取消）: " -ForegroundColor Yellow -NoNewline
+$m = T "`n请输入要清理的文件序号（支持 1,3,5 或 1-4；输入 ALL 全选；输入 N 取消）: " "`nFiles to clean (3, 1,3,5 or 1-4; input ALL to select everything; N to cancel): "
+Write-Host $m -ForegroundColor Yellow -NoNewline
 $userInput = ([string](Read-Host)).Trim()
 
 if ($userInput -eq '' -or $userInput -eq 'N') {
-    Write-Host "已取消" -ForegroundColor Gray
+    Write-Host (T '已取消' 'Cancelled.') -ForegroundColor Gray
     Wait-Exit
     return
 }
 
 if ($userInput -eq 'ALL' -or $userInput -eq '全选' -or $userInput -eq '全部') {
     $todo = $candidates
-    Write-Host "  已全选：$($todo.Count) 个文件" -ForegroundColor Cyan
+    $m = T "  已全选：$($todo.Count) 个文件" "  All selected: $($todo.Count) file(s)"
+    Write-Host $m -ForegroundColor Cyan
 } else {
     $selectedIndexes = @()
     $userInput -split ',' | ForEach-Object {
@@ -381,17 +460,18 @@ if ($userInput -eq 'ALL' -or $userInput -eq '全选' -or $userInput -eq '全部'
 }
 
 if (-not $todo -or $todo.Count -eq 0) {
-    Write-Host "没有匹配到有效序号，退出。" -ForegroundColor Gray
+    Write-Host (T '没有匹配到有效序号，退出。' 'No valid selection, aborting.') -ForegroundColor Gray
     Wait-Exit
     return
 }
 
 # ---------- 5. 回收站配额预检（每台电脑上现场重新计算） ----------
-Write-Host "`n[5/5] 回收站容量预检（按本机实际配置计算）..." -ForegroundColor Cyan
+Write-Host (T "`n[5/5] 回收站容量预检（按本机实际配置计算）..." "`n[5/5] Recycle-bin capacity pre-check (computed from this machine's settings)...") -ForegroundColor Cyan
 
 $policyCache = @{}
 $usedCache   = @{}
 
+# 分级用内部代号：A=直接回收 B=挤占回收 C=永久删除，显示时才翻译
 foreach ($f in $todo) {
     $d = $f.盘符
     if (-not $policyCache.ContainsKey($d)) { $policyCache[$d] = Get-RecyclePolicy $d }
@@ -401,33 +481,34 @@ foreach ($f in $todo) {
     }
 
     $pol = $policyCache[$d]
-    $tier = '直接回收'
+    $tier = 'A'
     $note = ''
 
     if (-not $pol.IsVolume) {
-        $tier = '永久删除'
-        $note = '不是本地卷（网络路径或其他），无法进入回收站'
+        $tier = 'C'
+        $note = T '不是本地卷（网络路径或其他），无法进入回收站' 'not a local volume (network path or other), cannot enter the Recycle Bin'
     }
     elseif (-not $pol.FixedDisk) {
-        $tier = '永久删除'
-        $note = '非固定磁盘（可移动/U盘），不支持回收站'
+        $tier = 'C'
+        $note = T '非固定磁盘（可移动/U盘），不支持回收站' 'not a fixed disk (removable/USB drive), Recycle Bin unsupported'
     }
     elseif ($pol.NukeOnDelete -eq 1) {
-        $tier = '永久删除'
-        $note = '该盘回收站已被设置为“删除时不移动到回收站”'
+        $tier = 'C'
+        $note = T '该盘回收站已被设置为「删除时不移动到回收站」' 'this volume is set to delete files without using the Recycle Bin'
     }
     elseif (-not $pol.HasFolder) {
-        $tier = '永久删除'
-        $note = '该盘没有 $Recycle.Bin 目录'
+        $tier = 'C'
+        $note = T '该盘没有 $Recycle.Bin 目录' 'this volume has no $Recycle.Bin folder'
     }
     elseif ($f.字节 -gt $pol.MaxBytes) {
-        $tier = '永久删除'
-        $note = "单个文件大于该盘回收站上限 $(Format-Size $pol.MaxBytes)，Windows 必然永久删除"
+        $tier = 'C'
+        $lim = Format-Size $pol.MaxBytes
+        $note = T "单个文件大于该盘回收站上限 $lim，Windows 必然永久删除" "file is larger than this volume's Recycle Bin limit $lim; Windows will delete it permanently"
     }
     elseif (($usedCache[$d] + $f.字节) -gt $pol.MaxBytes) {
-        $tier = '挤占回收'
-        $evict = $usedCache[$d] + $f.字节 - $pol.MaxBytes
-        $note = "空间不足，将挤掉回收站中最旧的约 $(Format-Size $evict)"
+        $tier = 'B'
+        $evict = Format-Size ($usedCache[$d] + $f.字节 - $pol.MaxBytes)
+        $note = T "空间不足，将挤掉回收站中最旧的约 $evict" "not enough space; about $evict of the oldest Recycle Bin entries will be pushed out"
     }
 
     $f | Add-Member -NotePropertyName 分级 -NotePropertyValue $tier -Force
@@ -437,28 +518,30 @@ foreach ($f in $todo) {
     $usedCache[$d] = $usedCache[$d] + $f.字节
 }
 
-Write-Host "`n本机回收站配置：" -ForegroundColor Gray
+Write-Host (T "`n本机回收站配置：" "`nRecycle-bin configuration on this machine:") -ForegroundColor Gray
+$fmtVol = T "   {0}  上限 {1}（{2}）  已占 {3}" "   {0}  limit {1} ({2})  used {3}"
+$fmtNonVol = T "   {0}  非本地卷，不支持回收站" "   {0}  not a local volume, Recycle Bin unsupported"
 $policyCache.Keys | Sort-Object | ForEach-Object {
     $p = $policyCache[$_]
-    $u = if ($IsAdmin) { Format-Size (Get-RecycleUsedBytes $_) } else { '未知(需管理员)' }
     if ($p.IsVolume) {
-        Write-Host ("   {0}  上限 {1}（{2}）  已占 {3}" -f $_, (Format-Size $p.MaxBytes), $p.MaxSource, $u) -ForegroundColor Gray
+        if ($IsAdmin) { $u = Format-Size (Get-RecycleUsedBytes $_) } else { $u = T '未知(需管理员)' 'unknown (needs admin)' }
+        Write-Host ($fmtVol -f $_, (Format-Size $p.MaxBytes), $p.MaxSource, $u) -ForegroundColor Gray
     } else {
-        Write-Host ("   {0}  非本地卷，不支持回收站" -f $_) -ForegroundColor Gray
+        Write-Host ($fmtNonVol -f $_) -ForegroundColor Gray
     }
 }
 
-$tierA = @($todo | Where-Object { $_.分级 -eq '直接回收' })
-$tierB = @($todo | Where-Object { $_.分级 -eq '挤占回收' })
-$tierC = @($todo | Where-Object { $_.分级 -eq '永久删除' })
+$tierA = @($todo | Where-Object { $_.分级 -eq 'A' })
+$tierB = @($todo | Where-Object { $_.分级 -eq 'B' })
+$tierC = @($todo | Where-Object { $_.分级 -eq 'C' })
 
 if ($tierA.Count -gt 0) {
-    Write-Host "`n可直接进回收站（可随时还原）：" -ForegroundColor Green
-    $tierA | Format-Table 序号, 风险, 大小GB, 盘符, 路径 -AutoSize -Wrap
+    Write-Host (T "`n可直接进回收站（可随时还原）：" "`nStraight to the Recycle Bin (restorable at any time):") -ForegroundColor Green
+    Show-OrphanTable -Items $tierA -Columns 'No', 'Risk', 'SizeGB', 'Drive', 'Path'
 }
 
 if ($tierB.Count -gt 0) {
-    Write-Host "`n可进回收站，但会挤掉回收站里最旧的条目：" -ForegroundColor Yellow
+    Write-Host (T "`n可进回收站，但会挤掉回收站里最旧的条目：" "`nWill go to the Recycle Bin, but pushes out the oldest entries:") -ForegroundColor Yellow
     foreach ($f in $tierB) {
         Write-Host "   [$($f.序号)] $($f.路径)" -ForegroundColor Yellow
         Write-Host "          $($f.说明)" -ForegroundColor DarkYellow
@@ -466,10 +549,11 @@ if ($tierB.Count -gt 0) {
 }
 
 if ($tierC.Count -gt 0) {
-    Write-Host "`n执行即永久删除、无法还原：" -ForegroundColor Red
+    Write-Host (T "`n执行即永久删除、无法还原：" "`nDeleted permanently on execution, not recoverable:") -ForegroundColor Red
+    $fmtSize = T "          大小 {0} GB，{1}" "          size {0} GB, {1}"
     foreach ($f in $tierC) {
         Write-Host "   [$($f.序号)] $($f.路径)" -ForegroundColor Red
-        Write-Host "          大小 $($f.大小GB) GB，$($f.说明)" -ForegroundColor DarkYellow
+        Write-Host ($fmtSize -f $f.大小GB, $f.说明) -ForegroundColor DarkYellow
     }
 }
 
@@ -483,18 +567,20 @@ if ($recyclable.Count -eq 0 -and $tierC.Count -eq 0) {
 # ---- 确认一：进回收站的部分 ----
 $c1 = ''
 if ($recyclable.Count -gt 0) {
-    $c1 = Read-Host "`n确认把上面 $($recyclable.Count) 个文件移入回收站？输入 YES 继续，其他键跳过"
+    $m = T "`n确认把上面 $($recyclable.Count) 个文件移入回收站？输入 YES 继续，其他键跳过" "`nMove the $($recyclable.Count) file(s) above to the Recycle Bin? Type YES to continue, any other key skips"
+    $c1 = Read-Host $m
 }
 
 # ---- 确认二：永久删除的部分 ----
 $nuke = $false
 if ($tierC.Count -gt 0) {
-    $c2 = Read-Host "确认永久删除上面 $($tierC.Count) 个文件？输入 NUKE 继续，其他键跳过"
+    $m = T "确认永久删除上面 $($tierC.Count) 个文件？输入 NUKE 继续，其他键跳过" "Permanently delete the $($tierC.Count) file(s) above? Type NUKE to continue, any other key skips"
+    $c2 = Read-Host $m
     if ($c2 -eq 'NUKE') { $nuke = $true }
 }
 
 if ($c1 -ne 'YES' -and -not $nuke) {
-    Write-Host "已取消，未做任何删除。" -ForegroundColor Gray
+    Write-Host (T '已取消，未做任何删除。' 'Cancelled, nothing was deleted.') -ForegroundColor Gray
     Wait-Exit
     return
 }
@@ -502,7 +588,8 @@ if ($c1 -ne 'YES' -and -not $nuke) {
 try {
     Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction Stop
 } catch {
-    Write-Host "`n无法加载 Microsoft.VisualBasic，无法调用删除 API，已中止。" -ForegroundColor Red
+    $m = T "`n无法加载 Microsoft.VisualBasic，无法调用删除 API，已中止。" "`nCannot load Microsoft.VisualBasic, the delete API is unavailable. Aborted."
+    Write-Host $m -ForegroundColor Red
     Wait-Exit
     return
 }
@@ -522,7 +609,7 @@ $failList  = @()
 
 # ---- 回收站部分：逐个删并核对是否真的进了回收站 ----
 if ($c1 -eq 'YES' -and $recyclable.Count -gt 0) {
-    Write-Host "`n正在移入回收站..." -ForegroundColor Cyan
+    Write-Host (T "`n正在移入回收站..." "`nMoving to the Recycle Bin...") -ForegroundColor Cyan
 
     $mapCache = @{}
     foreach ($f in $recyclable) {
@@ -534,15 +621,15 @@ if ($c1 -eq 'YES' -and $recyclable.Count -gt 0) {
         try {
             Invoke-DeleteOne $f.路径
         } catch {
-            $failList += "$($f.路径)  ->  调用失败: $_"
-            Write-Host "  失败: $($f.路径)" -ForegroundColor Red
+            $failList += (T "$($f.路径)  ->  调用失败: $_" "$($f.路径)  ->  call failed: $_")
+            Write-Host (T "  失败: $($f.路径)" "  FAILED: $($f.路径)") -ForegroundColor Red
             Write-Host "    $_" -ForegroundColor Gray
             continue
         }
 
         if (Test-Path -LiteralPath $f.路径) {
-            $failList += "$($f.路径)  ->  删除后文件仍存在（被占用或无权限）"
-            Write-Host "  失败: 文件仍存在，可能被 vmms 占用  $($f.路径)" -ForegroundColor Red
+            $failList += (T "$($f.路径)  ->  删除后文件仍存在（被占用或无权限）" "$($f.路径)  ->  file still exists after delete (locked or access denied)")
+            Write-Host (T "  失败: 文件仍存在，可能被 vmms 占用  $($f.路径)" "  FAILED: file still exists, possibly locked by vmms  $($f.路径)") -ForegroundColor Red
             continue
         }
 
@@ -560,14 +647,14 @@ if ($c1 -eq 'YES' -and $recyclable.Count -gt 0) {
         if (-not $IsAdmin) {
             # 非管理员读不全回收站目录，核对会误报，这里只按文件是否消失判断
             $okRecycle++
-            Write-Host "  已删除（非管理员，无法核对回收站副本）: $($f.路径)" -ForegroundColor Yellow
+            Write-Host (T "  已删除（非管理员，无法核对回收站副本）: $($f.路径)" "  Deleted (non-admin, Recycle Bin copy not verifiable): $($f.路径)") -ForegroundColor Yellow
         } elseif ($hit) {
             $okRecycle++
-            Write-Host "  已进回收站: $($f.路径)" -ForegroundColor Green
+            Write-Host (T "  已进回收站: $($f.路径)" "  In the Recycle Bin: $($f.路径)") -ForegroundColor Green
         } else {
             $warnNuke++
-            $failList += "$($f.路径)  ->  已被删除，但回收站中未找到副本（实际是永久删除）"
-            Write-Host "  警告: 文件已消失但回收站里没有，实际是永久删除！" -ForegroundColor Red
+            $failList += (T "$($f.路径)  ->  已被删除，但回收站中未找到副本（实际是永久删除）" "$($f.路径)  ->  deleted, but no copy found in the Recycle Bin (that is a permanent delete)")
+            Write-Host (T '  警告: 文件已消失但回收站里没有，实际是永久删除！' '  WARNING: the file is gone but it is not in the Recycle Bin - that is a permanent delete!') -ForegroundColor Red
             Write-Host "         $($f.路径)" -ForegroundColor Red
         }
     }
@@ -575,38 +662,49 @@ if ($c1 -eq 'YES' -and $recyclable.Count -gt 0) {
 
 # ---- 永久删除部分 ----
 if ($nuke -and $tierC.Count -gt 0) {
-    Write-Host "`n正在永久删除..." -ForegroundColor Cyan
+    Write-Host (T "`n正在永久删除..." "`nDeleting permanently...") -ForegroundColor Cyan
     foreach ($f in $tierC) {
         try {
             Invoke-DeleteOne $f.路径
             if (Test-Path -LiteralPath $f.路径) {
-                $failList += "$($f.路径)  ->  删除后文件仍存在"
-                Write-Host "  失败: $($f.路径)" -ForegroundColor Red
+                $failList += (T "$($f.路径)  ->  删除后文件仍存在" "$($f.路径)  ->  file still exists after delete")
+                Write-Host (T "  失败: $($f.路径)" "  FAILED: $($f.路径)") -ForegroundColor Red
             } else {
-                Write-Host "  已永久删除: $($f.路径)" -ForegroundColor Yellow
+                Write-Host (T "  已永久删除: $($f.路径)" "  Permanently deleted: $($f.路径)") -ForegroundColor Yellow
             }
         } catch {
-            $failList += "$($f.路径)  ->  $_"
-            Write-Host "  失败: $($f.路径)" -ForegroundColor Red
+            $failList += (T "$($f.路径)  ->  $_" "$($f.路径)  ->  $_")
+            Write-Host (T "  失败: $($f.路径)" "  FAILED: $($f.路径)") -ForegroundColor Red
             Write-Host "    $_" -ForegroundColor Gray
         }
     }
 }
 
 # ---------- 汇总 ----------
-Write-Host "`n===== 结果 =====" -ForegroundColor Cyan
-Write-Host "  进入回收站（可还原）: $okRecycle 个" -ForegroundColor Green
-if ($warnNuke -gt 0) { Write-Host "  已删除但未进回收站: $warnNuke 个" -ForegroundColor Red }
-if ($nuke) { Write-Host "  永久删除: $($tierC.Count) 个" -ForegroundColor Yellow }
-if ($recyclable.Count -gt 0 -and $c1 -ne 'YES') { Write-Host "  跳过（未确认回收）: $($recyclable.Count) 个" -ForegroundColor Gray }
-if ($tierC.Count -gt 0 -and -not $nuke) { Write-Host "  跳过（未确认永久删除）: $($tierC.Count) 个" -ForegroundColor Gray }
-
-if ($failList.Count -gt 0) {
-    Write-Host "`n问题清单：" -ForegroundColor Yellow
-    $failList | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
-    Write-Host "`n常见原因：文件被 vmms 占用，可先 net stop vmms 后重跑；也可用 Handle64.exe 查占用进程。" -ForegroundColor Gray
+Write-Host (T "`n===== 结果 =====" "`n===== Result =====") -ForegroundColor Cyan
+Write-Host (T "  进入回收站（可还原）: $okRecycle 个" "  In the Recycle Bin (restorable): $okRecycle") -ForegroundColor Green
+if ($warnNuke -gt 0) {
+    Write-Host (T "  已删除但未进回收站: $warnNuke 个" "  Deleted but not in the Recycle Bin: $warnNuke") -ForegroundColor Red
+}
+if ($nuke) {
+    Write-Host (T "  永久删除: $($tierC.Count) 个" "  Permanently deleted: $($tierC.Count)") -ForegroundColor Yellow
+}
+if ($recyclable.Count -gt 0 -and $c1 -ne 'YES') {
+    Write-Host (T "  跳过（未确认回收）: $($recyclable.Count) 个" "  Skipped (recycling not confirmed): $($recyclable.Count)") -ForegroundColor Gray
+}
+if ($tierC.Count -gt 0 -and -not $nuke) {
+    Write-Host (T "  跳过（未确认永久删除）: $($tierC.Count) 个" "  Skipped (permanent delete not confirmed): $($tierC.Count)") -ForegroundColor Gray
 }
 
-Write-Host "`n想让大文件也能进回收站：右键回收站 → 属性 → 选中该盘 → 自定义大小，调到不小于最大文件体积。" -ForegroundColor Cyan
+if ($failList.Count -gt 0) {
+    Write-Host (T "`n问题清单：" "`nIssues:") -ForegroundColor Yellow
+    $failList | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+    $m = T "`n常见原因：文件被 vmms 占用，可先 net stop vmms 后重跑；也可用 Handle64.exe 查占用进程。" "`nCommon cause: the file is locked by vmms. Run 'net stop vmms' and retry, or use Handle64.exe to find the process holding it."
+    Write-Host $m -ForegroundColor Gray
+}
 
-Wait-Exit "全部完成，按任意键退出..."
+$m = T "`n想让大文件也能进回收站：右键回收站 → 属性 → 选中该盘 → 自定义大小，调到不小于最大文件体积。" "`nTo let large files reach the Recycle Bin: right-click the Recycle Bin > Properties > select the drive > Custom size, and set it to at least the largest file size."
+Write-Host $m -ForegroundColor Cyan
+
+$m = T '全部完成，按任意键退出...' 'Done. Press any key to exit...'
+Wait-Exit $m

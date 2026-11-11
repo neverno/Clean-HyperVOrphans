@@ -12,7 +12,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = '1.0.6.0',
+    [string]$Version = '1.1.0.0',
     [string]$OutputFile = 'Clean-HyperVOrphans.exe'
 )
 
@@ -50,12 +50,18 @@ if (-not (Get-Module -ListAvailable ps2exe)) {
 Import-Module ps2exe -Force
 
 # ---- 4. 编译 ----
-if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Force }
+# 旧产物改名留档，不直接删（部分环境对 Remove-Item 有安全拦截）
+if (Test-Path -LiteralPath $out) {
+    $bak = "$out.bak"
+    if (Test-Path -LiteralPath $bak) { $bak = "$out.bak2" }
+    Move-Item -LiteralPath $out -Destination $bak -Force
+    Write-Host "旧产物已改名为 $(Split-Path $bak -Leaf)" -ForegroundColor Gray
+}
 
 try {
     Invoke-PS2EXE -inputFile $src -outputFile $out -requireAdmin -iconFile $ico `
-        -title '清理 Hyper-V 残留磁盘' `
-        -description '扫描并清理 Hyper-V 已删虚拟机残留的 VHDX/AVHDX；删除前校验回收站配额，可区分可直接回收与会被永久删除的文件' `
+        -title '清理 Hyper-V 残留磁盘 / Hyper-V Orphan Disk Cleanup' `
+        -description '扫描并清理 Hyper-V 已删虚拟机残留的 VHDX/AVHDX；删除前校验回收站配额，区分可直接回收与会被永久删除的文件。中英双语界面（-Lang auto|zh|en）。' `
         -product 'Clean-HyperVOrphans' -company 'neverno' -version $Version | Out-Null
 } catch {
     # ps2exe 收尾清理临时文件时可能抛错，此时 exe 通常已正常写出
@@ -74,6 +80,8 @@ $checks = [ordered]@{
     '自动提权清单'        = $txt.Contains('requireAdministrator')
     '脚本正文已嵌入'      = $txt.Contains('回收站容量预检')
     '全选功能'            = $txt.Contains('输入 ALL 全选')
+    '英文界面已嵌入'      = $txt.Contains('Environment self-check')
+    '语言参数'            = $txt.Contains('-Lang')
 }
 Write-Host "`n校验结果:" -ForegroundColor Cyan
 foreach ($k in $checks.Keys) {
